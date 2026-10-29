@@ -1,0 +1,234 @@
+diff -ruN -x '*.o' -x '*.ko' -x '.*.cmd' -x '*.mod*' -x Module.symvers -x modules.order -x build.log -x Kbuild ath-parent/ath9k/ath9k.h ath9k-csi/ath9k.h
+--- ath-parent/ath9k/ath9k.h	2026-03-25 00:47:58.584211900 +0300
++++ ath9k-csi/ath9k.h	2026-03-25 00:28:22.709376700 +0300
+@@ -980,6 +980,24 @@
+ 
+ #define ATH9K_NUM_CHANCTX  2 /* supports 2 operating channels */
+ 
++/* === CSI Tool — structures === */
++#define CSI_BUFF_SIZE   4096
++
++struct csi_buf_t {
++	u8  buf[CSI_BUFF_SIZE];
++	int len;
++	struct timespec64 ts;
++};
++
++struct csi_state {
++	struct csi_buf_t  csi_buf;
++	spinlock_t        csi_lock;
++	wait_queue_head_t csi_waitq;
++	struct dentry     *csi_dentry;
++	bool              csi_ready;
++};
++/* === End CSI structures === */
++
+ struct ath_softc {
+ 	struct ieee80211_hw *hw;
+ 	struct device *dev;
+@@ -1078,6 +1096,7 @@
+ 	u32 rng_last;
+ 	char rng_name[sizeof("ath9k_65535")];
+ #endif
++	struct csi_state csi;  /* CSI Tool */
+ };
+ 
+ /********/
+diff -ruN -x '*.o' -x '*.ko' -x '.*.cmd' -x '*.mod*' -x Module.symvers -x modules.order -x build.log -x Kbuild ath-parent/ath9k/debug.c ath9k-csi/debug.c
+--- ath-parent/ath9k/debug.c	2026-03-25 00:47:58.584843200 +0300
++++ ath9k-csi/debug.c	2026-03-25 00:38:08.514094000 +0300
+@@ -1374,6 +1374,33 @@
+ 	ath9k_cmn_spectral_deinit_debug(&sc->spec_priv);
+ }
+ 
++
++/* === CSI Tool — debugfs interface === */
++static ssize_t read_csi(struct file *file, char __user *user_buf,
++                        size_t count, loff_t *ppos)
++{
++	struct ath_softc *sc = file->private_data;
++	struct csi_state *cs = &sc->csi;
++	unsigned long flags;
++	ssize_t ret;
++
++	wait_event_interruptible(cs->csi_waitq, cs->csi_ready);
++
++	spin_lock_irqsave(&cs->csi_lock, flags);
++	ret = simple_read_from_buffer(user_buf, count, ppos,
++				      cs->csi_buf.buf, cs->csi_buf.len);
++	cs->csi_ready = false;
++	spin_unlock_irqrestore(&cs->csi_lock, flags);
++	return ret;
++}
++
++static const struct file_operations fops_csi = {
++	.read   = read_csi,
++	.open   = simple_open,
++	.owner  = THIS_MODULE,
++	.llseek = default_llseek,
++};
++/* === End CSI debugfs === */
+ int ath9k_init_debug(struct ath_hw *ah)
+ {
+ 	struct ath_common *common = ath9k_hw_common(ah);
+@@ -1457,5 +1484,13 @@
+ 	debugfs_create_file("nf_override", 0600,
+ 			    sc->debug.debugfs_phy, sc, &fops_nf_override);
+ 
++
++	/* === CSI Tool — init === */
++	spin_lock_init(&sc->csi.csi_lock);
++	init_waitqueue_head(&sc->csi.csi_waitq);
++	sc->csi.csi_ready = false;
++	debugfs_create_file("csi_dump", 0400,
++			    sc->debug.debugfs_phy, sc, &fops_csi);
++	/* === End CSI init === */
+ 	return 0;
+ }
+diff -ruN -x '*.o' -x '*.ko' -x '.*.cmd' -x '*.mod*' -x Module.symvers -x modules.order -x build.log -x Kbuild ath-parent/ath9k/Makefile ath9k-csi/Makefile
+--- ath-parent/ath9k/Makefile	2026-03-25 00:47:58.582401200 +0300
++++ ath9k-csi/Makefile	2026-03-25 00:47:02.500793000 +0300
+@@ -1,81 +1,23 @@
+-# SPDX-License-Identifier: ISC
+-ath9k-y +=	beacon.o \
+-		gpio.o \
+-		init.o \
+-		main.o \
+-		recv.o \
+-		xmit.o \
+-		link.o \
+-		antenna.o \
+-		channel.o
++# Override des CONFIG nécessaires pour out-of-tree
++export CONFIG_ATH9K=m
++export CONFIG_ATH9K_PCI=y
++export CONFIG_ATH9K_DEBUGFS=y
++export CONFIG_ATH9K_BTCOEX_SUPPORT=y
++export CONFIG_ATH9K_DFS_CERTIFIED=y
++export CONFIG_ATH9K_HTC=n
++export CONFIG_ATH9K_WOW=n
++export CONFIG_ATH9K_HWRNG=n
++export CONFIG_ATH9K_TX99=n
++export CONFIG_ATH9K_STATION_STATISTICS=n
++export CONFIG_ATH9K_DFS_DEBUGFS=n
++
++KDIR  := /lib/modules/$(shell uname -r)/build
++PWD   := $(shell pwd)
++
++all:
++	$(MAKE) -C $(KDIR) M=$(PWD) \
++		EXTRA_CFLAGS="-I$(PWD) -DCONFIG_ATH9K_DEBUGFS -DCONFIG_ATH9K_PCI -DCONFIG_ATH9K_BTCOEX_SUPPORT -DCONFIG_ATH9K_DFS_CERTIFIED" \
++		modules
+ 
+-ath9k-$(CONFIG_ATH9K_BTCOEX_SUPPORT) += mci.o
+-ath9k-$(CONFIG_ATH9K_PCI) += pci.o
+-ath9k-$(CONFIG_ATH9K_AHB) += ahb.o
+-ath9k-$(CONFIG_ATH9K_DFS_DEBUGFS) += dfs_debug.o
+-ath9k-$(CONFIG_ATH9K_DFS_CERTIFIED) += dfs.o
+-ath9k-$(CONFIG_ATH9K_TX99) += tx99.o
+-ath9k-$(CONFIG_ATH9K_WOW) += wow.o
+-ath9k-$(CONFIG_ATH9K_HWRNG) += rng.o
+-
+-ath9k-$(CONFIG_ATH9K_DEBUGFS) += debug.o
+-
+-ath9k-$(CONFIG_ATH9K_STATION_STATISTICS) += debug_sta.o
+-
+-obj-$(CONFIG_ATH9K) += ath9k.o
+-
+-ath9k_hw-y:=	\
+-		ar9002_hw.o \
+-		ar9003_hw.o \
+-		hw.o \
+-		ar9003_phy.o \
+-		ar9002_phy.o \
+-		ar5008_phy.o \
+-		ar9002_calib.o \
+-		ar9003_calib.o \
+-		calib.o \
+-		eeprom.o \
+-		eeprom_def.o \
+-		eeprom_4k.o \
+-		eeprom_9287.o \
+-		ani.o \
+-		mac.o \
+-		ar9002_mac.o \
+-		ar9003_mac.o \
+-		ar9003_eeprom.o \
+-		ar9003_paprd.o
+-
+-ath9k_hw-$(CONFIG_ATH9K_WOW) += ar9003_wow.o
+-
+-ath9k_hw-$(CONFIG_ATH9K_BTCOEX_SUPPORT) += btcoex.o \
+-					   ar9003_mci.o \
+-					   ar9003_aic.o
+-
+-ath9k_hw-$(CONFIG_ATH9K_PCOEM) += ar9003_rtt.o
+-
+-ath9k_hw-$(CONFIG_ATH9K_DYNACK) += dynack.o
+-
+-obj-$(CONFIG_ATH9K_HW) += ath9k_hw.o
+-
+-obj-$(CONFIG_ATH9K_COMMON) += ath9k_common.o
+-ath9k_common-y:=	common.o \
+-			common-init.o \
+-			common-beacon.o \
+-
+-ath9k_common-$(CONFIG_ATH9K_COMMON_DEBUG) += common-debug.o
+-ath9k_common-$(CONFIG_ATH9K_COMMON_SPECTRAL) += common-spectral.o
+-
+-ath9k_htc-y +=	htc_hst.o \
+-		hif_usb.o \
+-		wmi.o \
+-		htc_drv_txrx.o \
+-		htc_drv_main.o \
+-		htc_drv_beacon.o \
+-		htc_drv_init.o \
+-		htc_drv_gpio.o
+-
+-ath9k_htc-$(CONFIG_ATH9K_HTC_DEBUGFS) += htc_drv_debug.o
+-
+-obj-$(CONFIG_ATH9K_HTC) += ath9k_htc.o
+-
+-obj-$(CONFIG_ATH9K_PCI_NO_EEPROM) += ath9k_pci_owl_loader.o
++clean:
++	$(MAKE) -C $(KDIR) M=$(PWD) clean
+diff -ruN -x '*.o' -x '*.ko' -x '.*.cmd' -x '*.mod*' -x Module.symvers -x modules.order -x build.log -x Kbuild ath-parent/ath9k/recv.c ath9k-csi/recv.c
+--- ath-parent/ath9k/recv.c	2026-03-25 00:47:58.586946200 +0300
++++ ath9k-csi/recv.c	2026-03-25 00:33:24.382709800 +0300
+@@ -16,6 +16,9 @@
+ 
+ #include <linux/dma-mapping.h>
+ #include "ath9k.h"
++#include <linux/spinlock.h>
++#include <linux/wait.h>
++#include <linux/ktime.h>
+ #include "ar9003_mac.h"
+ 
+ #define SKB_CB_ATHBUF(__skb)	(*((struct ath_rxbuf **)__skb->cb))
+@@ -1118,6 +1121,26 @@
+ 		if (retval)
+ 			goto requeue_drop_frag;
+ 
++		/* === CSI Tool — capture brute === */
++		{
++			struct csi_state *cs = &sc->csi;
++			unsigned long flags;
++			int csi_len;
++
++			spin_lock_irqsave(&cs->csi_lock, flags);
++			csi_len = min_t(int, rxs->chains * 56, CSI_BUFF_SIZE);
++			if (csi_len > 0) {
++				memcpy(cs->csi_buf.buf,
++				       hdr_skb->data, csi_len);
++				cs->csi_buf.len = csi_len;
++				ktime_get_real_ts64(&cs->csi_buf.ts);
++				cs->csi_ready = true;
++				wake_up_interruptible(&cs->csi_waitq);
++			}
++			spin_unlock_irqrestore(&cs->csi_lock, flags);
++		}
++		/* === End CSI capture === */
++
+ 		/* Ensure we always have an skb to requeue once we are done
+ 		 * processing the current buffer's skb */
+ 		requeue_skb = ath_rxbuf_alloc(common, common->rx_bufsize, GFP_ATOMIC);
